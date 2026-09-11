@@ -1,13 +1,14 @@
 {
   "window": {
-    "width": 1180,
-    "height": 900
+    "width": 1120,
+    "height": 760
   },
   "appearance_mode": "System",
   "color_theme": "blue",
   "gitea": {
     "base_url": "https://git.example.com",
     "api_base_path": "/api/v1",
+    "auth_method": "ssh-agent",
     "token": "",
     "token_env": "GITEA_TOKEN",
     "username": "",
