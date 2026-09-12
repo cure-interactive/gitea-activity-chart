@@ -13,6 +13,7 @@ dist/
 
 # Runtime state generated beside scripts
 /config.json
+/activity-cache.json
 /config_restore.json
 /repository_manifest.json
 /font_selection_state.json

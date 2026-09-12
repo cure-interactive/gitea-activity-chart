@@ -16,6 +16,7 @@ Notes:
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import datetime as dt
 import hashlib
 import json
@@ -29,9 +30,10 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 def _restart_with_compatible_windows_python() -> bool:
@@ -124,10 +126,14 @@ except Exception as e:
 
 APP_TITLE = "Gitea Activity Chart - Cure Interactive"
 APP_USER_MODEL_ID = "CureInteractive.GiteaActivityChart"
+ACTIVITY_FETCH_WORKERS = 6
 
 PATH_DIR_SCRIPT = os.path.abspath(os.path.dirname(__file__))
 PATH_CONFIG_JSON = os.path.join(PATH_DIR_SCRIPT, "config.json")
 PATH_CONFIG_DEFAULT_JSON = os.path.join(PATH_DIR_SCRIPT, "config-default.json")
+PATH_ACTIVITY_CACHE_JSON = os.path.join(PATH_DIR_SCRIPT, "activity-cache.json")
+
+ActivityCacheKey = tuple[str, str, str, str, str, str, bool]
 
 DEFAULT_CONFIG: dict[str, Any] = {
   "window": {
@@ -200,6 +206,66 @@ def load_or_create_config() -> dict[str, Any]:
     return _deep_merge_dict(template, user_cfg)
   _write_json_atomic(PATH_CONFIG_JSON, template)
   return _deep_copy_json_dict(template)
+
+
+def load_activity_cache(path: str = PATH_ACTIVITY_CACHE_JSON) -> dict[ActivityCacheKey, list[tuple[dt.date, int]]]:
+  payload = _read_json(path)
+  if not payload or payload.get("version") != 1 or not isinstance(payload.get("entries"), list):
+    return {}
+  cache: dict[ActivityCacheKey, list[tuple[dt.date, int]]] = {}
+  for entry in payload["entries"]:
+    if not isinstance(entry, dict) or not isinstance(entry.get("points"), list):
+      continue
+    fields = [entry.get(name) for name in ("base_url", "api_path", "viewer", "username", "start_date", "end_date")]
+    if not all(isinstance(value, str) and value for value in fields) or not isinstance(entry.get("only_performed_by"), bool):
+      continue
+    try:
+      start_date = dt.date.fromisoformat(fields[4])
+      end_date = dt.date.fromisoformat(fields[5])
+      points: list[tuple[dt.date, int]] = []
+      for value in entry["points"]:
+        if not isinstance(value, list) or len(value) != 2 or isinstance(value[1], bool):
+          raise ValueError("invalid cache point")
+        day = dt.date.fromisoformat(str(value[0]))
+        count = int(value[1])
+        if count < 0:
+          raise ValueError("invalid cache count")
+        points.append((day, count))
+    except (TypeError, ValueError):
+      continue
+    expected_days = (end_date - start_date).days + 1
+    if expected_days < 1 or len(points) != expected_days:
+      continue
+    if any(day != start_date + dt.timedelta(days=index) for index, (day, _count) in enumerate(points)):
+      continue
+    key: ActivityCacheKey = (
+      fields[0].rstrip("/").casefold(),
+      fields[1].rstrip("/").casefold(),
+      fields[2].casefold(),
+      fields[3].casefold(),
+      fields[4],
+      fields[5],
+      entry["only_performed_by"],
+    )
+    cache[key] = points
+  return cache
+
+
+def save_activity_cache(cache: dict[ActivityCacheKey, list[tuple[dt.date, int]]], path: str = PATH_ACTIVITY_CACHE_JSON) -> None:
+  entries = []
+  for key, points in cache.items():
+    base_url, api_path, viewer, username, start_date, end_date, only_performed_by = key
+    entries.append({
+      "base_url": base_url,
+      "api_path": api_path,
+      "viewer": viewer,
+      "username": username,
+      "start_date": start_date,
+      "end_date": end_date,
+      "only_performed_by": only_performed_by,
+      "points": [[day.isoformat(), count] for day, count in points],
+    })
+  _write_json_atomic(path, {"version": 1, "entries": entries})
 
 
 def set_windows_app_user_model_id(app_id: str) -> None:
@@ -447,29 +513,26 @@ class SshSignatureAuth(requests.auth.AuthBase):
     else:
       self._signer = OpenSshAgentSigner()
     self._lock = threading.Lock()
-    self._last_created: int | None = None
+    self._key_id = base64.b64encode(hashlib.sha256(self._signer.public_blob).digest()).decode("ascii").rstrip("=")
 
   def __call__(self, request):
+    created = int(time.time())
+    expires = created + 30
+    target = request.path_url
+    request_id = uuid.uuid4().hex
+    request.headers["X-Request-Id"] = request_id
+    signing_text = "\n".join([
+      f"(request-target): {request.method.lower()} {target}",
+      f"(created): {created}",
+      f"(expires): {expires}",
+      f"x-request-id: {request_id}",
+    ])
     with self._lock:
-      current = time.time()
-      if self._last_created is not None and int(current) <= self._last_created:
-        time.sleep(self._last_created + 1 - current + 0.01)
-        current = time.time()
-      created = max(int(current), (self._last_created or -1) + 1)
-      self._last_created = created
-      expires = created + 30
-      target = request.path_url
-      signing_text = "\n".join([
-        f"(request-target): {request.method.lower()} {target}",
-        f"(created): {created}",
-        f"(expires): {expires}",
-      ])
       signature = self._signer.sign(signing_text.encode("utf-8"))
-      fingerprint = base64.b64encode(hashlib.sha256(self._signer.public_blob).digest()).decode("ascii").rstrip("=")
-      request.headers["Signature"] = (
-        f'keyId="SHA256:{fingerprint}",algorithm="hs2019",created={created},expires={expires},'
-        f'headers="(request-target) (created) (expires)",signature="{base64.b64encode(signature).decode("ascii")}"'
-      )
+    request.headers["Signature"] = (
+      f'keyId="SHA256:{self._key_id}",algorithm="hs2019",created={created},expires={expires},'
+      f'headers="(request-target) (created) (expires) x-request-id",signature="{base64.b64encode(signature).decode("ascii")}"'
+    )
     return request
 
 
@@ -583,6 +646,48 @@ class GiteaClient:
       page += 1
     return total
 
+  def count_user_activity_for_days(
+    self,
+    *,
+    username: str,
+    days: list[dt.date],
+    page_limit: int,
+    only_performed_by: bool,
+    max_workers: int = ACTIVITY_FETCH_WORKERS,
+    progress_callback: Callable[[int, int, dt.date, int], None] | None = None,
+  ) -> dict[dt.date, int]:
+    requested_days = list(dict.fromkeys(days))
+    if not requested_days:
+      return {}
+
+    def fetch(day: dt.date) -> tuple[dt.date, int]:
+      return day, self.count_user_activity_for_day(
+        username=username,
+        day=day,
+        page_limit=page_limit,
+        only_performed_by=only_performed_by,
+      )
+
+    worker_count = max(1, min(int(max_workers), len(requested_days)))
+    if worker_count == 1:
+      results: dict[dt.date, int] = {}
+      for completed, day in enumerate(requested_days, start=1):
+        _day, count = fetch(day)
+        results[day] = count
+        if progress_callback is not None:
+          progress_callback(completed, len(requested_days), day, count)
+      return results
+
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+      future_to_day = {executor.submit(fetch, day): day for day in requested_days}
+      for completed, future in enumerate(concurrent.futures.as_completed(future_to_day), start=1):
+        day, count = future.result()
+        results[day] = count
+        if progress_callback is not None:
+          progress_callback(completed, len(requested_days), day, count)
+    return results
+
 
 class GiteaActivityChartApp(ctk.CTk):
   def __init__(self) -> None:
@@ -616,10 +721,13 @@ class GiteaActivityChartApp(ctk.CTk):
     self._heatmap_layout_snapshot: dict[str, int] = {}
     self._visible_user_logins: dict[str, str] = {}
     self._visible_user_options: list[str] = []
-    self._activity_cache: dict[tuple[str, str, str, str, bool], list[tuple[dt.date, int]]] = {}
+    self._current_login = ""
     self._log_lines: list[str] = []
     self._log_window = None
     self._log_text = None
+    self._activity_cache = load_activity_cache()
+    if self._activity_cache:
+      self._log_lines.append(f"Loaded {len(self._activity_cache)} saved activity cache entr{'y' if len(self._activity_cache) == 1 else 'ies'}.")
 
     gitea_cfg = self.config_data.get("gitea", {})
     query_cfg = self.config_data.get("query", {})
@@ -649,7 +757,7 @@ class GiteaActivityChartApp(ctk.CTk):
     self._build_ui()
     self.protocol("WM_DELETE_WINDOW", self._on_close)
     self._draw_empty_states()
-    self.after(350, lambda: self._on_refresh_users(show_errors=False))
+    self._startup_refresh_id = self.after(350, lambda: self._on_refresh_users(show_errors=False))
 
   def _build_ui(self) -> None:
     self.grid_columnconfigure(0, weight=1)
@@ -799,8 +907,10 @@ class GiteaActivityChartApp(ctk.CTk):
     self.btn_fetch.grid(row=0, column=0, padx=(0, 8), pady=8)
     ctk.CTkButton(actions, text="Export CSV", command=self._on_export_csv).grid(row=0, column=1, padx=(0, 8), pady=8)
     ctk.CTkButton(actions, text="Clear Data", command=self._clear_results).grid(row=0, column=2, padx=(0, 8), pady=8)
+    self.btn_clear_cache = ctk.CTkButton(actions, text="Clear Cache", width=100, command=self._clear_activity_cache)
+    self.btn_clear_cache.grid(row=0, column=3, padx=(0, 8), pady=8)
     self.btn_toggle_log = ctk.CTkButton(actions, text="Open Log", width=90, command=self._toggle_log)
-    self.btn_toggle_log.grid(row=0, column=3, padx=(0, 8), pady=8)
+    self.btn_toggle_log.grid(row=0, column=4, padx=(0, 8), pady=8)
     self.progress = ctk.CTkProgressBar(actions)
     self.progress.grid(row=0, column=6, sticky="ew", padx=(10, 10), pady=8)
     self.progress.set(0)
@@ -953,6 +1063,7 @@ class GiteaActivityChartApp(ctk.CTk):
     self._busy = busy
     self.btn_fetch.configure(state="disabled" if busy else "normal")
     self.btn_refresh_users.configure(state="disabled" if busy else "normal")
+    self.btn_clear_cache.configure(state="disabled" if busy else "normal")
 
   def _selected_username(self) -> str:
     value = self.var_user_selection.get().strip()
@@ -963,26 +1074,52 @@ class GiteaActivityChartApp(ctk.CTk):
       return match.group(1).strip()
     return value.removeprefix("@").strip()
 
-  def _activity_cache_key(self, username: str) -> tuple[str, str, str, str, bool]:
+  def _activity_cache_key(self, username: str) -> ActivityCacheKey:
     days_back = max(1, min(3660, _safe_int(self.var_days_back.get(), 180)))
     include_today = bool(self.var_include_today.get())
     end_date = dt.date.today() if include_today else (dt.date.today() - dt.timedelta(days=1))
     start_date = end_date - dt.timedelta(days=days_back - 1)
     return (
       self.var_base_url.get().strip().rstrip("/").casefold(),
+      (self.var_api_base_path.get().strip() or "/api/v1").rstrip("/").casefold(),
+      self._current_login.casefold(),
       username.casefold(),
       start_date.isoformat(),
       end_date.isoformat(),
       bool(self.var_only_performed_by.get()),
     )
 
+  def _cached_points_for_key(self, cache_key: ActivityCacheKey) -> dict[dt.date, int]:
+    wanted_start = dt.date.fromisoformat(cache_key[4])
+    wanted_end = dt.date.fromisoformat(cache_key[5])
+    points_by_day: dict[dt.date, int] = {}
+    for stored_key, points in self._activity_cache.items():
+      same_scope = stored_key[:4] == cache_key[:4] and stored_key[6] == cache_key[6]
+      if not same_scope:
+        continue
+      for day, count in points:
+        if wanted_start <= day <= wanted_end:
+          points_by_day[day] = count
+    return points_by_day
+
+  def _cached_series_for_key(self, cache_key: ActivityCacheKey) -> list[tuple[dt.date, int]] | None:
+    start_date = dt.date.fromisoformat(cache_key[4])
+    end_date = dt.date.fromisoformat(cache_key[5])
+    points_by_day = self._cached_points_for_key(cache_key)
+    days = _daterange(start_date, end_date)
+    if any(day not in points_by_day for day in days):
+      return None
+    return [(day, points_by_day[day]) for day in days]
+
   def _on_user_selected(self, _display_value: str) -> None:
     username = self._selected_username()
     if not username:
       return
     self.var_username.set(username)
-    cache_key = self._activity_cache_key(username)
-    cached = self._activity_cache.get(cache_key)
+    cached = None
+    if self._current_login:
+      cache_key = self._activity_cache_key(username)
+      cached = self._cached_series_for_key(cache_key)
     if cached is not None:
       self._last_username = username
       self._last_results = list(cached)
@@ -1043,6 +1180,7 @@ class GiteaActivityChartApp(ctk.CTk):
     threading.Thread(target=worker, daemon=True).start()
 
   def _on_users_loaded(self, current_login: str, users: list[dict[str, Any]]) -> None:
+    self._current_login = current_login
     ordered = sorted(
       users,
       key=lambda user: (
@@ -1061,8 +1199,8 @@ class GiteaActivityChartApp(ctk.CTk):
     self.var_user_selection.set(selected_display)
     self.var_username.set(selected_login)
     self._set_busy(False)
-    self._set_status(f"{len(options)} visible users", 0)
     self._log(f"Loaded {len(options)} visible users; current user is {current_login}.")
+    self._on_user_selected(selected_display)
 
   def _on_user_refresh_failed(self, error_text: str, show_errors: bool) -> None:
     self._set_busy(False)
@@ -1076,12 +1214,16 @@ class GiteaActivityChartApp(ctk.CTk):
       return
     try:
       username = self._selected_username()
-      if not username:
+      client = None
+      if not username or not self._current_login:
         client = self._build_client()
         user = client.get_current_user()
-        username = str(user.get("login") or user.get("username") or "").strip()
-        if not username:
+        current_login = str(user.get("login") or user.get("username") or "").strip()
+        if not current_login:
           raise RuntimeError("Username is blank and could not be resolved from /user.")
+        self._current_login = current_login
+        if not username:
+          username = current_login
       self.var_username.set(username)
       cfg = self._collect_config_from_ui()
       days_back = int(cfg["query"]["days_back"])
@@ -1090,11 +1232,16 @@ class GiteaActivityChartApp(ctk.CTk):
       start_date = end_date - dt.timedelta(days=days_back - 1)
       cache_key = self._activity_cache_key(username)
       self._save_config()
-      cached = self._activity_cache.get(cache_key)
-      if cached is not None:
-        self._on_fetch_complete(username, list(cached), cache_key, from_cache=True)
+      days = _daterange(start_date, end_date)
+      cached_by_day = self._cached_points_for_key(cache_key)
+      refresh_days = {end_date} if include_today and end_date == dt.date.today() else set()
+      days_to_fetch = [day for day in days if day not in cached_by_day or day in refresh_days]
+      if not days_to_fetch:
+        cached = [(day, cached_by_day[day]) for day in days]
+        self._on_fetch_complete(username, cached, cache_key, from_cache=True, reused_days=len(cached))
         return
-      client = self._build_client()
+      if client is None:
+        client = self._build_client()
     except Exception as e:
       messagebox.showerror(APP_TITLE, str(e))
       return
@@ -1104,24 +1251,30 @@ class GiteaActivityChartApp(ctk.CTk):
 
     self._set_busy(True)
     self._set_status("Fetching activity...", 0)
-    self._log(f"Fetching {days_back} day(s) for {username} from {start_date.isoformat()} to {end_date.isoformat()}")
+    reused_days = len(days) - len(days_to_fetch)
+    self._log(
+      f"Fetching {len(days_to_fetch)} day(s) for {username} from {start_date.isoformat()} to {end_date.isoformat()}; "
+      f"reusing {reused_days} cached day(s) with up to {min(ACTIVITY_FETCH_WORKERS, len(days_to_fetch))} concurrent worker(s)."
+    )
 
     def worker() -> None:
       try:
-        points: list[tuple[dt.date, int]] = []
-        days = _daterange(start_date, end_date)
-        total_days = len(days)
-        for idx, day in enumerate(days, start=1):
-          count = client.count_user_activity_for_day(
-            username=username,
-            day=day,
-            page_limit=page_limit,
-            only_performed_by=only_performed_by,
-          )
-          points.append((day, count))
-          pct = idx / total_days if total_days else 1.0
-          self.after(0, lambda idx=idx, total_days=total_days, day=day, count=count, pct=pct: self._on_fetch_progress(idx, total_days, day, count, pct))
-        self.after(0, lambda: self._on_fetch_complete(username, points, cache_key))
+        points_by_day = dict(cached_by_day)
+        fetched_by_day = client.count_user_activity_for_days(
+          username=username,
+          days=days_to_fetch,
+          page_limit=page_limit,
+          only_performed_by=only_performed_by,
+          progress_callback=lambda idx, total, day, count: self.after(
+            0,
+            lambda idx=idx, total=total, day=day, count=count: self._on_fetch_progress(
+              idx, total, day, count, idx / total if total else 1.0
+            ),
+          ),
+        )
+        points_by_day.update(fetched_by_day)
+        points = [(day, points_by_day[day]) for day in days]
+        self.after(0, lambda: self._on_fetch_complete(username, points, cache_key, reused_days=reused_days))
       except Exception as e:
         self.after(0, lambda: self._on_fetch_failed(str(e)))
 
@@ -1135,17 +1288,23 @@ class GiteaActivityChartApp(ctk.CTk):
     self,
     username: str,
     points: list[tuple[dt.date, int]],
-    cache_key: tuple[str, str, str, str, bool],
+    cache_key: ActivityCacheKey,
     *,
     from_cache: bool = False,
+    reused_days: int = 0,
   ) -> None:
     self._set_busy(False)
-    self._set_status("Idle", 1.0 if points else 0.0)
+    self._set_status("Loaded from cache" if from_cache else "Idle", 1.0 if points else 0.0)
     self._last_username = username
     self._last_results = list(points)
     self._activity_cache[cache_key] = list(points)
+    if not from_cache:
+      try:
+        save_activity_cache(self._activity_cache)
+      except Exception as error:
+        self._log(f"Could not save activity cache: {error}")
     action = "Loaded" if from_cache else "Fetched"
-    suffix = " from memory" if from_cache else ""
+    suffix = " from saved cache" if from_cache else (f" with {reused_days} cached day(s)" if reused_days else "")
     self._log(f"{action} {len(points)} daily rows for {username}{suffix}.")
     self._redraw_from_last_results()
 
@@ -1162,6 +1321,23 @@ class GiteaActivityChartApp(ctk.CTk):
     self._draw_empty_states()
     self._log("Cleared in-memory results.")
     self._set_status("Idle", 0)
+
+  def _clear_activity_cache(self) -> None:
+    entry_count = len(self._activity_cache)
+    if entry_count == 0 and not os.path.isfile(PATH_ACTIVITY_CACHE_JSON):
+      messagebox.showinfo(APP_TITLE, "The activity cache is already empty.")
+      return
+    if not messagebox.askyesno(APP_TITLE, "Clear every saved activity cache entry?\n\nThe current chart will remain visible."):
+      return
+    try:
+      if os.path.isfile(PATH_ACTIVITY_CACHE_JSON):
+        os.remove(PATH_ACTIVITY_CACHE_JSON)
+    except Exception as error:
+      messagebox.showerror(APP_TITLE, f"Failed to clear activity cache:\n{error}")
+      return
+    self._activity_cache.clear()
+    self._set_status("Cache cleared", 0)
+    self._log(f"Cleared {entry_count} saved activity cache entr{'y' if entry_count == 1 else 'ies'}.")
 
   def _draw_empty_states(self) -> None:
     self.lbl_total.configure(text="0")
