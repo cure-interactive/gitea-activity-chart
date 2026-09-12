@@ -6,8 +6,17 @@ The authenticated account can load every user visible through Gitea user
 search, choose one from an editable selector, and fetch that user's activity.
 The current account appears first as `Me`, and manually entered usernames are
 also accepted. Typing filters the visible-user dropdown. Repeated views of the
-same user, date range, and activity filter reuse an in-memory cache for the
-lifetime of the app.
+same server, authenticated viewer, user, date range, and activity filter reuse
+a persistent `activity-cache.json` file. Overlapping date ranges reuse saved
+days and fetch only missing dates; a range including today refreshes today's
+count. The machine-local cache is ignored by Git and never stores tokens or
+SSH keys.
+
+Missing days are fetched with up to six concurrent workers. SSH-authenticated
+requests include a signed unique request ID, which satisfies Gitea's replay
+protection without imposing the former one-request-per-second delay. Per-day
+feed pagination and filtering remain unchanged, so the faster path returns the
+same activity counts.
 
 ## Requirements
 
@@ -77,6 +86,10 @@ keeps ordinary active days distinguishable when a few days have large peaks.
 The primary `Activity` tab contains user selection, query controls, charts, and
 activity actions. The second `Configuration` tab contains server connection,
 authentication, key selection, and configuration saving.
+
+`Clear Data` clears only the displayed chart. `Clear Cache` removes every
+saved and in-memory activity cache entry after confirmation while leaving the
+current chart visible.
 
 ## Run
 
