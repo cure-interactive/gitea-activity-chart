@@ -2,6 +2,8 @@
 
 Desktop app for querying Gitea activity and visualizing activity counts over time.
 
+Historical feature validation notes are in [doc/validation](doc/validation/).
+
 The authenticated account can load every user visible through Gitea user
 search, choose one from an editable selector, and fetch that user's activity.
 The current account appears first as `Me`, and manually entered usernames are
