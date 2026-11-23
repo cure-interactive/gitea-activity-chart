@@ -21,9 +21,8 @@ dist/
 /svg_live_viewer.log
 
 # Logs and local output
-_temp/
-_log/
-_logs/
+__temp/
+__log/
 *.log
 
 # Node / web build output
